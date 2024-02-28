@@ -1,6 +1,7 @@
 #define MINIAUDIO_IMPLEMENTATION
 
 #include <gtk/gtk.h>
+#include <stack>
 #include "miniaudio.h"
 #include "glib/gprintf.h"
 
@@ -8,9 +9,11 @@
 #define SAMPLE_FORMAT       ma_format_f32
 #define DEVICE_CHANNELS     1
 #define DEVICE_SAMPLE_RATE  48000
-#define EXPORT_FORMAT       ma_formatf32
+#define EXPORT_FORMAT       ma_format_f32
 #define EXPORT_CHANNELS     1
 #define EXPORT_SAMPLE_RATE  48000
+
+using namespace std;
 
 // g++ $( pkg-config --cflags gtk4 ) -o silly_synth silly_synth.cpp $( pkg-config --libs gtk4 ) -ldl -lm -lpthread
 
@@ -45,21 +48,11 @@ int scrubberWidth = 5;
 int scrubberHeightOffset = 20;
 double playbackTime = 0.0; // in seconds I think
 bool playing = false;
+bool exporting = false;
+
+ma_device device;
 
 
-
-void init_notes()
-{
-  notes = new bool*[pianoGridWidth];
-  for (int i = 0; i < pianoGridWidth; i++)
-  {
-    notes[i] = new bool[pianoKeyCount];
-    for (int j = 0; j < pianoKeyCount; j++)
-    {
-      notes[i][j] = false;
-    }
-  }
-}
 
 float microseconds_to_seconds(int ms)
 {
@@ -95,15 +88,6 @@ static void edit_note(GtkWidget* widget)
   
 }
 
-void delete_notes()
-{
-  for (int i = 0; i < pianoGridWidth; i++)
-  {
-    delete notes[i];
-  }
-  delete notes;
-}
-
 bool get_note(int x, int y)
 {
   if (x < 0 || x >= pianoGridWidth || y < 0 || y >= pianoKeyCount)
@@ -129,8 +113,167 @@ void toggle_note(int x, int y)
     return;
   }
   notes[x][y] = !notes[x][y];
-  g_print("note toggled\n");
+  // g_print("note toggled\n");
 }
+
+enum ActionType
+{
+  TOGGLE_NOTE,
+  ADD_NOTE,
+  REMOVE_NOTE,
+  CLEAR_NOTES
+};
+
+struct Action
+{
+  ActionType type;
+  int data1;
+  int data2;
+};
+
+
+
+stack<Action> undoStack;
+stack<Action> redoStack;
+bool hasSavedNotes = false;
+bool** savedNotes; // allows for ONE undo of a clear action
+
+static void clear_redo_stack()
+{
+  redoStack = stack<Action>();
+}
+
+static void undo(GtkWidget* widget, gpointer data)
+{
+  if (undoStack.empty())
+  {
+    return;
+  }
+
+  Action a = undoStack.top();
+  undoStack.pop();
+  redoStack.push(a);
+
+  // perform undo operation
+  switch (a.type)
+  {
+    case TOGGLE_NOTE:
+    {
+      toggle_note(a.data1, a.data2);
+      break;
+    }
+    case ADD_NOTE:
+    {
+      set_note(a.data1, a.data2, false);
+      break;
+    }
+    case REMOVE_NOTE:
+    {
+      set_note(a.data1, a.data2, true);
+      break;
+    }
+    case CLEAR_NOTES:
+    {
+      if (hasSavedNotes)
+      {
+        for (int i = 0; i < pianoGridWidth; i++)
+        {
+          for (int j = 0; j < pianoKeyCount; j++)
+          {
+            set_note(i, j, savedNotes[i][j]);
+          }
+        }
+        hasSavedNotes = false;
+      }
+      else
+      {
+        undoStack = stack<Action>(); // clear undo stack, since we dont know what was in the roll befor the clear
+      }
+      break;
+    }
+  }
+  gtk_widget_queue_draw(GTK_WIDGET(data));  
+}
+
+static void redo(GtkWidget* widger, gpointer data)
+{
+  if (redoStack.empty())
+  {
+    return;
+  }
+
+  Action a = redoStack.top();
+  redoStack.pop();
+  undoStack.push(a);
+
+  // perform undo operation
+  switch (a.type)
+  {
+    case TOGGLE_NOTE:
+    {
+      toggle_note(a.data1, a.data2);
+      break;
+    }
+    case ADD_NOTE:
+    {
+      set_note(a.data1, a.data2, true);
+      break;
+    }
+    case REMOVE_NOTE:
+    {
+      set_note(a.data1, a.data2, false);
+      break;
+    }
+    case CLEAR_NOTES:
+    {
+      for (int i = 0; i < pianoGridWidth; i++)
+      {
+        for (int j = 0; j < pianoKeyCount; j++)
+        {
+          savedNotes[i][j] = get_note(i,j);
+          set_note(i, j, false);
+        }
+      }
+      hasSavedNotes = true;
+    }
+  }
+  gtk_widget_queue_draw(GTK_WIDGET(data));  
+}
+
+gboolean handle_undo_shortcut(GtkWidget* widget, GVariant* args, gpointer user_data)
+{
+  undo(widget, NULL);
+  return true;
+}
+
+void init_notes()
+{
+  notes = new bool*[pianoGridWidth];
+  savedNotes = new bool*[pianoGridWidth];
+  for (int i = 0; i < pianoGridWidth; i++)
+  {
+    notes[i] = new bool[pianoKeyCount];
+    savedNotes[i] = new bool[pianoKeyCount];
+    for (int j = 0; j < pianoKeyCount; j++)
+    {
+      notes[i][j] = false;
+      savedNotes[i][j] = false;
+    }
+  }
+}
+
+void delete_notes()
+{
+  for (int i = 0; i < pianoGridWidth; i++)
+  {
+    delete notes[i];
+    delete savedNotes[i];
+  }
+  delete notes;
+  delete savedNotes;
+}
+
+
 
 static void clear_notes(GtkWidget* widget, gpointer data)
 {
@@ -138,11 +281,21 @@ static void clear_notes(GtkWidget* widget, gpointer data)
   {
     for (int j = 0; j < pianoGridWidth; j++)
     {
+      savedNotes[i][j] = get_note(i,j);
       set_note(i, j, false);
     }
   }
+  hasSavedNotes = true;
+
+  Action clearAction;
+  clearAction.type = ActionType::CLEAR_NOTES;
+  undoStack.push(clearAction);
+  clear_redo_stack();
+
+
   gtk_widget_queue_draw(GTK_WIDGET(data));  
 }
+
 
 double dragStartX = 0.0;
 double dragStartY = 0.0;
@@ -166,6 +319,14 @@ static void piano_roll_primary_drag_begin(GtkGestureDrag *gesture,
     double yd = (height - y - pianoRollBorder) / keyHeight;
     // g_printf("xd: %f, yd: %f\n", xd, yd);
     toggle_note((int) xd, (int) yd);
+
+    Action toggleAction;
+    toggleAction.type = ActionType::TOGGLE_NOTE;
+    toggleAction.data1 = (int) xd;
+    toggleAction.data2 = (int) yd;
+    undoStack.push(toggleAction);
+    clear_redo_stack();
+
     editX = (int) xd;
     editY = (int) yd;
     editNoteSoundActive = true;
@@ -196,6 +357,14 @@ static void piano_roll_primary_drag_update (GtkGestureClick *gesture,
       editX = (int) xd;
       editY = (int) yd;
       toggle_note((int) xd, (int) yd);
+
+      Action toggleAction;
+      toggleAction.type = ActionType::TOGGLE_NOTE;
+      toggleAction.data1 = (int) xd;
+      toggleAction.data2 = (int) yd;
+      undoStack.push(toggleAction);
+      clear_redo_stack();
+
       gtk_widget_queue_draw(area);
     }
   }
@@ -399,7 +568,7 @@ static void update_instrument_select(GtkWidget* widget, gpointer data)
 
 void data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount)
 {
-	if (playing)
+	if (playing || exporting)
 	{
 	  // In playback mode copy data to pOutput. In capture mode read data from pInput. In full-duplex mode, both
     // pOutput and pInput will be valid and you can move data from pInput into pOutput. Never process more than
@@ -408,7 +577,10 @@ void data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uin
     // MA_ASSERT(pDevice->playback.channels == DEVICE_CHANNELS);
 
     // MA_ASSERT(pSineWave != NULL);
-    
+   
+    // g_print("playing or exporting\n"); 
+    // g_printf("playbackX = %i\n", playbackX);
+ 
     float* pOutputF32 = (float*)pOutput;
     for (int i = 0; i < frameCount; i++)
     {
@@ -426,7 +598,7 @@ void data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uin
           temp[i] = 0.0f;
         }      
         ma_waveform_read_pcm_frames(waves[k], temp, frameCount, NULL);
-
+        // g_print("waveform read pcm frames\n");
         for (int i = 0; i < frameCount; i++)
         {
           pOutputF32[i] += temp[i];
@@ -447,11 +619,11 @@ void data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uin
   }
 }
 
+
+
 static void export_song(GtkWidget* widget, gpointer data)
 {
-  // TODO
-
-  /*
+  
   ma_encoder_config config = ma_encoder_config_init(ma_encoding_format_wav, EXPORT_FORMAT, EXPORT_CHANNELS, EXPORT_SAMPLE_RATE);
   ma_encoder encoder;
   ma_result result = ma_encoder_init_file("my_file.wav", &config, &encoder);
@@ -461,18 +633,60 @@ static void export_song(GtkWidget* widget, gpointer data)
     return;
   }
   
-  ma_uint64 framesWritten;
-  result = ma_encoder_write_pcm_frames(&encoder, pPCMFramesToWrite, framesToWrite, NULL);
-  if (result != MA_SUCCESS) {
-    // Error
-    g_print("encountered an error while exporting\n");
-    ma_encoder_uninit(&encoder);
-    return;
+  ma_uint64 bufferLength = 1; // IDK if 64 is good here. Can it be a smaller number?
+
+  // iterate through the whole song with the sample rate
+  
+  double playbackTimeSave = playbackTime;
+  int playbackXSave = playbackX;
+  playbackTime = 0.0;
+  playbackX = 0;
+  exporting = true;
+
+  int totalWrittenFrames = 0;
+  int totalFramesToWrite = (double)pianoGridWidth / tempo * EXPORT_SAMPLE_RATE;
+  
+  g_print("Beginning export to file...\n");
+
+  while (totalWrittenFrames < totalFramesToWrite)
+  {
+    ma_uint64 framesWritten;
+    
+    float outputBuffer[bufferLength];
+    data_callback(&device, &outputBuffer, NULL, bufferLength);    
+
+    result = ma_encoder_write_pcm_frames(&encoder, &outputBuffer, bufferLength, &framesWritten); 
+    if (result != MA_SUCCESS) {
+      // Error
+      g_print("encountered an error while exporting\n");
+      
+      exporting = false;
+      
+      return;
+    }
+    
+    /*
+    for (int i = 0; i < bufferLength; i++)
+    {
+      g_printf("Output for frame %i: %f\n", totalWrittenFrames + 1 + i, outputBuffer[i]);  
+    }
+    */
+
+    totalWrittenFrames += framesWritten;
+    playbackTime = (double)totalWrittenFrames / EXPORT_SAMPLE_RATE;
+    playbackX = (int) (playbackTime * tempo);
+        
+
+    // delete[] outputBuffer;
   }
+  
+  g_printf("Finished export. Total frames written: %i\n", totalWrittenFrames);
 
-
+  exporting = false;
+  playbackX = playbackXSave;
+  playbackTime = playbackTimeSave;
   ma_encoder_uninit(&encoder);
-  */
+  
 }
 
 
@@ -511,6 +725,18 @@ static void activate (GtkApplication* app, gpointer user_data)
   g_signal_connect(pianoRollPrimaryDrag, "drag-update", G_CALLBACK(piano_roll_primary_drag_update), (void*) pianoRoll);
   g_signal_connect(pianoRollPrimaryDrag, "drag-end", G_CALLBACK(piano_roll_primary_drag_end), (void*) pianoRoll);
 
+  // GtkShortcut* undoShortcut = gtk_shortcut_new(gtk_shortcut_trigger_parse_string("<Control>Z"), gtk_callback_action_new((GtkShortcutFunc)handle_undo_shortcut, NULL, NULL));
+  
+  /*
+  gtk_widget_class_add_binding (
+    GtkWidgetClass* pianoRoll,
+    guint (guint)'Z',
+    GdkModifierType ,
+    GtkShortcutFunc callback,
+    const char* format_string
+  */
+
+
   // piano roll animation
   gtk_widget_add_tick_callback(pianoRoll, animate_piano_roll, NULL, NULL);
   GdkFrameClock* pianoClock = gtk_widget_get_frame_clock(pianoRoll);
@@ -521,38 +747,62 @@ static void activate (GtkApplication* app, gpointer user_data)
 
 
   gtk_window_set_child(GTK_WINDOW(window), vpaned);
-	
+
+
+  // buttons:
+  
+  /*
+  GtkTooltips* buttonTooltips;
+  buttonTooltips = gtk_tooltips_new();
+  gtk_tooltips_set_colors(buttonTooltips, )
+  */  
 
   GtkWidget* exportButton = gtk_button_new_with_label("Export");  
   g_signal_connect (exportButton, "clicked", G_CALLBACK(export_song), NULL);
-  gtk_box_append(GTK_BOX(menuBox), exportButton);  
+  gtk_widget_set_tooltip_markup(exportButton, "<span foreground=\"gray\">Exports song to .wav file (WIP)</span>");
+  gtk_box_append(GTK_BOX(menuBox), exportButton);
 
   const char* instrumentStrings[] = {"sine wave", "square wave", "triangle wave", "saw wave"};
-  // instrumentStrings[0] = ;
-  // instrumentStrings[1] = ;
-  // instrumentStrings[2] = ;
-  // instrumentStrings[3] = ;  
 
   GtkWidget* instrumentSelectButton = gtk_drop_down_new_from_strings(instrumentStrings);  
-  gtk_box_append(GTK_BOX(menuBox), instrumentSelectButton);  
+  gtk_box_append(GTK_BOX(menuBox), instrumentSelectButton);
   // a bit annoying, drop down menus are still in development
+  gtk_widget_set_tooltip_markup(instrumentSelectButton, "<span foreground=\"gray\">Instrument selection</span>");
   g_signal_connect(instrumentSelectButton, "state-flags-changed", G_CALLBACK(update_instrument_select), NULL);
 
   GtkWidget* playButton  = gtk_button_new_with_label("Play");
   g_signal_connect (playButton, "clicked", G_CALLBACK(start_playback), (void*) pianoRoll);
+  gtk_widget_set_tooltip_markup(playButton, "<span foreground=\"gray\">Begins audio playback</span>");
   gtk_box_append(GTK_BOX(menuBox), playButton);
+  
 
   GtkWidget* stopButton  = gtk_button_new_with_label("Stop");
   g_signal_connect (stopButton, "clicked", G_CALLBACK(stop_playback), (void*) pianoRoll);
+  gtk_widget_set_tooltip_markup(stopButton, "<span foreground=\"gray\">Stops audio playback</span>");
   gtk_box_append(GTK_BOX(menuBox), stopButton);
+
 
   GtkWidget* resetButton  = gtk_button_new_with_label("Reset");
   g_signal_connect (resetButton, "clicked", G_CALLBACK(reset_playback), (void*) pianoRoll);
+  gtk_widget_set_tooltip_markup(resetButton, "<span foreground=\"gray\">Returns playback scrubber to start of song</span>");
   gtk_box_append(GTK_BOX(menuBox), resetButton);
 
   GtkWidget* clearButton  = gtk_button_new_with_label("Clear");
   g_signal_connect (clearButton, "clicked", G_CALLBACK(clear_notes), (void*) pianoRoll);
+  gtk_widget_set_tooltip_markup(clearButton, "<span foreground=\"gray\">Clears piano roll (Only one clear can be undone!)</span>");
   gtk_box_append(GTK_BOX(menuBox), clearButton);
+
+  GtkWidget* undoButton  = gtk_button_new_with_label("Undo");
+  g_signal_connect (undoButton, "clicked", G_CALLBACK(undo), (void*) pianoRoll);
+  gtk_widget_set_tooltip_markup(undoButton, "<span foreground=\"gray\">Undoes piano roll action</span>");
+  gtk_box_append(GTK_BOX(menuBox), undoButton);
+
+  GtkWidget* redoButton  = gtk_button_new_with_label("Redo");
+  g_signal_connect (redoButton, "clicked", G_CALLBACK(redo), (void*) pianoRoll);
+  gtk_widget_set_tooltip_markup(redoButton, "<span foreground=\"gray\">Redoes piano roll action</span>");
+  gtk_box_append(GTK_BOX(menuBox), redoButton);
+  
+
 
 	// gtk_widget_set_halign(box, GTK_ALIGN_CENTER);
 	// gtk_widget_set_valign(box, GTK_ALIGN_CENTER);
@@ -589,7 +839,6 @@ int main(int argc, char** argv)
   config.dataCallback      = data_callback;   // This function will be called when miniaudio needs more data.
   config.pUserData         = NULL;
 
-  ma_device device;
   if (ma_device_init(NULL, &config, &device) != MA_SUCCESS) {
       return -1;  // Failed to initialize the device.
   }
@@ -631,4 +880,3 @@ int main(int argc, char** argv)
 
 	return status;
 }
-
